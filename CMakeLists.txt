@@ -47,12 +47,33 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user sources here
+    # FreeRTOS kernel —— 放在 Third_Party/ 下, CubeMX 重新生成不会清空
+    # (Middlewares/ 在每次 Generate 时会被整个删掉, 不要再放用户自管源码)
+    Third_Party/FreeRTOS/tasks.c
+    Third_Party/FreeRTOS/queue.c
+    Third_Party/FreeRTOS/list.c
+    Third_Party/FreeRTOS/timers.c
+    Third_Party/FreeRTOS/event_groups.c
+    Third_Party/FreeRTOS/stream_buffer.c
+    # 协程，用不到可以注释掉以节省 Flash
+    # Third_Party/FreeRTOS/croutine.c
+    # 内存管理：heap_4.c 带碎片合并，最常用
+    Third_Party/FreeRTOS/portable/MemMang/heap_4.c
+    # 移植层：GCC + Cortex-M3（不要改用 portable/RVDS，那是 ARMCC/Keil 的汇编语法）
+    Third_Party/FreeRTOS/portable/GCC/ARM_CM3/port.c
+
+    # 板级驱动 BSP
+    Core/BSP/lcd.c
+    Core/BSP/dht11.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    Third_Party/FreeRTOS/include                  # FreeRTOS.h / task.h / queue.h ...
+    Third_Party/FreeRTOS/portable/GCC/ARM_CM3     # portmacro.h
+    Third_Party/FreeRTOS                          # FreeRTOSConfig.h
+    Core/BSP                                      # lcd.h / lcdfont.h / dht11.h
+    # Core/Inc、Drivers/... 已由 cmake/stm32cubemx 以 INTERFACE 方式提供，无需重复添加
 )
 
 # Add project symbols (macros)
