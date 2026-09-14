@@ -4,33 +4,39 @@
 #include "task.h"
 
 /* ==========================================================================
- * 为什么要用 DWT 做微秒延时?
+ * Why use DWT for microsecond delays?
  * --------------------------------------------------------------------------
- * HAL_Delay() 最小单位是 1ms, 而 DHT11 的时序是微秒级(26us vs 70us 区分 0/1)。
- * Cortex-M3 内核自带一个 24 位的时钟周期计数器 DWT->CYCCNT, 每 1 个 CPU 周期
- * 加 1。72MHz 下 1us = 72 个计数, 精度足够。它不受中断、不受 RTOS 调度影响,
- * 是最靠谱的裸机微秒计时源。
+ * HAL_Delay() has a 1 ms granularity, but the DHT11 timing is microsecond
+ * level: a '0' bit is a 26 us high pulse, a '1' bit is 70 us. Every Cortex-M3
+ * carries a 24-bit cycle counter, DWT->CYCCNT, which increments once per CPU
+ * cycle. At 72 MHz 1 us = 72 counts, which is plenty of resolution. It is not
+ * affected by interrupts or by RTOS scheduling, which makes it the most
+ * reliable bare-metal microsecond time source available here.
  * ==========================================================================
  */
 
-static uint32_t usTicks = 72U;      /* 1us 对应的 CPU 周期数, Init 时重算 */
+static uint32_t usTicks = 72U;      /* CPU cycles per microsecond, recomputed
+                                     * in DHT11_Init() from SystemCoreClock */
 
 /* ------------------------------------------------------------------ */
-/*                          底层工具函数                              */
+/*                        Low level helpers                           */
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief 打开 DWT 周期计数器(Cortex-M3 上默认是关的)
+ * @brief  Enable the DWT cycle counter (it is off by default on Cortex-M3).
  */
 static void DWT_Init( void )
 {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  /* 允许访问 DWT 寄存器 */
-    DWT->CYCCNT       = 0UL;                         /* 计数清零            */
-    DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;      /* 启动计数            */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  /* grant access to DWT   */
+    DWT->CYCCNT       = 0UL;                         /* reset the counter     */
+    DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;      /* start counting        */
 }
 
 /**
- * @brief  微秒级阻塞延时
+ * @brief  Blocking microsecond delay.
+ * @param  us : microseconds to wait
+ * @note   Relies on unsigned 32-bit wrap-around for the subtraction, which is
+ *         well defined, so a counter roll-over in the middle is harmless.
  */
 static void DelayUs( uint32_t us )
 {
@@ -39,12 +45,12 @@ static void DelayUs( uint32_t us )
 
     while( ( DWT->CYCCNT - start ) < wait )
     {
-        /* 依赖 32 位无符号数回绕做减法, 回绕也安全 */
+        /* spin */
     }
 }
 
 /**
- * @brief  把 PG9 配成推挽输出(主机拉低总线用)
+ * @brief  Configure PG9 as push-pull output (host pulls the bus low).
  */
 static void PinMode_Output( void )
 {
@@ -58,7 +64,8 @@ static void PinMode_Output( void )
 }
 
 /**
- * @brief  把 PG9 配成上拉输入(释放总线, 由外部 4.7K 电阻拉高)
+ * @brief  Configure PG9 as input with pull-up (release the bus; the external
+ *         4.7K resistor holds it high).
  */
 static void PinMode_Input( void )
 {
@@ -66,15 +73,16 @@ static void PinMode_Input( void )
 
     gpio.Pin   = DHT11_Pin;
     gpio.Mode  = GPIO_MODE_INPUT;
-    gpio.Pull  = GPIO_PULLUP;       /* 内部上拉约 40K, 只是兜底, 仍建议外接 4.7K */
+    gpio.Pull  = GPIO_PULLUP;       /* internal pull-up is ~40K: a fallback
+                                     * only, an external 4.7K is still advised */
     HAL_GPIO_Init( DHT11_GPIO_Port, &gpio );
 }
 
 /**
- * @brief  等到总线变成指定电平, 带超时
- * @param  level     : 要等的电平(GPIO_PIN_RESET / GPIO_PIN_SET)
- * @param  timeoutUs : 超时时间
- * @retval 0 = 等到了; 1 = 超时(说明传感器没响应 / 掉线)
+ * @brief  Wait until the bus reaches the given level, with a timeout.
+ * @param  level     : level to wait for (GPIO_PIN_RESET / GPIO_PIN_SET)
+ * @param  timeoutUs : how long to wait before giving up
+ * @retval 0 = level reached; 1 = timed out (sensor silent or disconnected)
  */
 static uint8_t WaitForLevel( GPIO_PinState level, uint32_t timeoutUs )
 {
@@ -85,15 +93,16 @@ static uint8_t WaitForLevel( GPIO_PinState level, uint32_t timeoutUs )
     {
         if( ( DWT->CYCCNT - start ) > wait )
         {
-            return 1U;      /* 超时 */
+            return 1U;      /* timeout */
         }
     }
     return 0U;
 }
 
 /**
- * @brief  从总线上读 1 个字节(8 bit)
- * @retval 读到的字节; 中途超时返回 0(调用方会因校验失败而丢弃整帧)
+ * @brief  Read one byte (8 bits) from the bus.
+ * @retval the byte; 0 if a timeout happened mid-byte. The caller then discards
+ *         the whole frame because the checksum will not match.
  */
 static uint8_t ReadByte( void )
 {
@@ -107,50 +116,51 @@ static uint8_t ReadByte( void )
 
         data <<= 1;
 
-        /* 每一 bit 都以 50us 低电平开头 */
+        /* Every bit starts with a 50 us low pulse */
         if( WaitForLevel( GPIO_PIN_RESET, 100U ) != 0U )
         {
             return 0U;
         }
 
-        /* 低电平结束 -> 高电平开始, 此刻起开始计时 */
+        /* Low ends -> high begins; start measuring here */
         if( WaitForLevel( GPIO_PIN_SET, 100U ) != 0U )
         {
             return 0U;
         }
         t0 = DWT->CYCCNT;
 
-        /* 等这个高电平结束, 就得出了它的宽度 */
+        /* Wait for that high pulse to end: that gives us its width */
         WaitForLevel( GPIO_PIN_RESET, 100U );
 
         highUs = ( DWT->CYCCNT - t0 ) / usTicks;
 
         if( highUs > DHT11_BIT_1_MIN_US )
         {
-            data |= 0x01U;      /* 70us -> '1' */
+            data |= 0x01U;      /* 70 us -> '1' */
         }
-        /* 26~28us -> '0', 什么都不用做 */
+        /* 26..28 us -> '0', nothing to do */
     }
 
     return data;
 }
 
 /* ------------------------------------------------------------------ */
-/*                            对外接口                                */
+/*                            Public API                              */
 /* ------------------------------------------------------------------ */
 
 void DHT11_Init( void )
 {
-    __HAL_RCC_GPIOG_CLK_ENABLE();   /* 就算 CubeMX 配过, 再开一次也无害 */
+    __HAL_RCC_GPIOG_CLK_ENABLE();   /* harmless even if CubeMX already did it */
 
-    usTicks = SystemCoreClock / 1000000UL;   /* 72MHz -> 72 */
+    usTicks = SystemCoreClock / 1000000UL;   /* 72 MHz -> 72 */
 
     DWT_Init();
 
     PinMode_Output();
-    HAL_GPIO_WritePin( DHT11_GPIO_Port, DHT11_Pin, GPIO_PIN_SET );  /* 空闲态 = 高 */
+    HAL_GPIO_WritePin( DHT11_GPIO_Port, DHT11_Pin, GPIO_PIN_SET );  /* idle = high */
 
-    vTaskDelay( pdMS_TO_TICKS( 1000 ) );     /* 上电后等 1s 越过不稳定期 */
+    vTaskDelay( pdMS_TO_TICKS( 1000 ) );     /* 1 s to pass the power-on
+                                              * unstable period */
 }
 
 uint8_t DHT11_Read( DHT11_Data_t *pData )
@@ -164,26 +174,29 @@ uint8_t DHT11_Read( DHT11_Data_t *pData )
         return 0U;
     }
 
-    /* ------- 1. 主机发起始信号 ----------------------------------------
-     * 拉低 >= 18ms。这 20ms 里用 vTaskDelay, 让调度器能跑别的任务,
-     * 不浪费 CPU(这段对时序不敏感, 长一点也没关系)。                   */
+    /* ------- 1. Host sends the start signal -----------------------------
+     * Pull low for >= 18 ms. We use vTaskDelay for these 20 ms so the
+     * scheduler can run other tasks instead of burning CPU. This part is not
+     * timing critical, so a slightly longer low pulse does no harm.        */
     PinMode_Output();
     HAL_GPIO_WritePin( DHT11_GPIO_Port, DHT11_Pin, GPIO_PIN_RESET );
     vTaskDelay( pdMS_TO_TICKS( 20 ) );
 
     HAL_GPIO_WritePin( DHT11_GPIO_Port, DHT11_Pin, GPIO_PIN_SET );
-    DelayUs( DHT11_START_HIGH_US );          /* 释放总线 20~40us */
+    DelayUs( DHT11_START_HIGH_US );          /* release the bus for 20..40 us */
 
-    PinMode_Input();                         /* 转输入, 交出总线控制权 */
+    PinMode_Input();                         /* switch to input, hand the bus
+                                              * over to the sensor */
 
-    /* ------- 2. 下面是微秒级严格时序, 必须关调度 ----------------------
-     * taskENTER_CRITICAL() 把 BASEPRI 写成 5, 屏蔽掉优先级数值 >= 5 的
-     * 中断和任务切换。万一被别的中断打断几百 us, 40 个 bit 的电平宽度
-     * 就全乱了, 读出来的是乱码。                                        */
+    /* ------- 2. From here on timing is strict: lock the scheduler -------
+     * taskENTER_CRITICAL() writes BASEPRI = 5, masking every interrupt with
+     * a priority number >= 5 and stopping task switches. A single interrupt
+     * stealing a few hundred microseconds here would smear all 40 bit widths
+     * and the result would be garbage.                                     */
     taskENTER_CRITICAL();
 
-    /* DHT11 响应: 先拉低 80us, 再拉高 80us */
-    if( WaitForLevel( GPIO_PIN_RESET, 100U ) != 0U )    /* 等响应低电平 */
+    /* DHT11 response: 80 us low, then 80 us high */
+    if( WaitForLevel( GPIO_PIN_RESET, 100U ) != 0U )    /* wait for low */
     {
         taskEXIT_CRITICAL();
         PinMode_Output();
@@ -191,7 +204,7 @@ uint8_t DHT11_Read( DHT11_Data_t *pData )
         return 0U;
     }
 
-    if( WaitForLevel( GPIO_PIN_SET, 100U ) != 0U )      /* 等响应高电平 */
+    if( WaitForLevel( GPIO_PIN_SET, 100U ) != 0U )      /* wait for high */
     {
         taskEXIT_CRITICAL();
         PinMode_Output();
@@ -199,8 +212,9 @@ uint8_t DHT11_Read( DHT11_Data_t *pData )
         return 0U;
     }
 
-    /* ------- 3. 收 40 bit = 5 字节 -----------------------------------
-     * 顺序: 湿度整数 / 湿度小数 / 温度整数 / 温度小数 / 校验和          */
+    /* ------- 3. Receive 40 bits = 5 bytes -------------------------------
+     * Order: humidity int / humidity dec / temperature int / temp dec /
+     * checksum                                                            */
     for( i = 0U; i < 5U; i++ )
     {
         buf[ i ] = ReadByte();
@@ -208,17 +222,17 @@ uint8_t DHT11_Read( DHT11_Data_t *pData )
 
     taskEXIT_CRITICAL();
 
-    /* 释放总线回到空闲态 */
+    /* Release the bus back to the idle state */
     PinMode_Output();
     HAL_GPIO_WritePin( DHT11_GPIO_Port, DHT11_Pin, GPIO_PIN_SET );
 
-    /* ------- 4. 校验 --------------------------------------------------
-     * 校验和 = 前 4 个字节之和的低 8 位                                 */
+    /* ------- 4. Verify -------------------------------------------------
+     * Checksum = low 8 bits of the sum of the first 4 bytes                */
     sum = ( uint8_t )( buf[ 0 ] + buf[ 1 ] + buf[ 2 ] + buf[ 3 ] );
 
     if( sum != buf[ 4 ] )
     {
-        return 0U;      /* 数据有误, 放弃这一帧 */
+        return 0U;      /* corrupt frame, throw it away */
     }
 
     pData->humi_int = buf[ 0 ];

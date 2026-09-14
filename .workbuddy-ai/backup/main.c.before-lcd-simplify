@@ -53,30 +53,80 @@
 #define DHT11_PERIOD_MS         2000U
 
 /* ---------------------------------------------------------------------------
- * UI layout - PORTRAIT 240 x 320
+ * UI geometry - PORTRAIT 240 x 320
  * ---------------------------------------------------------------------------
- * The font is 16 x 24 px, so a 240 px line holds 15 characters. That is the
- * only real constraint here: every string below has to end before x = 239.
+ *   +------------------------+  0
+ *   |     DHT11 MONITOR      |  blue header, 29 px, title centred
+ *   +------------------------+  29
+ *   |  TEMPERATURE           |  40  caption, native 16x24 font
+ *   |  23.5 C                |  72  reading, 2x font (32 x 48 per char)
+ *   |  --------------------- |  132 rule
+ *   |  HUMIDITY              |  144 caption
+ *   |  45.0 %                |  176 reading, 2x font
+ *   |  --------------------- |  236 rule
+ *   |  [] Status: OK         |  244 status square + text
+ *   |  OK:12                 |  272 counter, one line each
+ *   |  ERR:0                 |  296 counter
+ *   +------------------------+  320
  *
- *   12   DHT11 MONITOR     heading
- *   64   Temperature       caption
- *   92   23.5 C            reading
- *  136   Humidity          caption
- *  164   45.0 %            reading
- *  216   Status: OK        status line
- *  256   OK:12             counters, one per line
- *  288   ERR:0
+ * Widths matter on a 240 px screen: the native font is 16 px per character,
+ * so a line holds only 15 of them, and the 2x font is 32 px per character.
+ * Every string is a FIXED width, so redrawing never leaves leftovers, and
+ * none of them may end past x = 239:
+ *   "DHT11 MONITOR"  = 13 chars = 208 px  (x = 16 .. 223)
+ *   "TEMPERATURE"    = 11 chars = 176 px  (x = 12 .. 187)
+ *   "HUMIDITY"       =  8 chars = 128 px  (x = 12 .. 139)
+ *   "23.5 C"         =  6 chars = 192 px  (x = 12 .. 203, drawn with the 2x font)
+ *   "Status: WAIT"   = 12 chars = 192 px  (x = 30 .. 221)
+ *   "Status: OK  "   = 12 chars = 192 px  (x = 30 .. 221)
+ *   "Status: ERR "   = 12 chars = 192 px  (x = 30 .. 221)
+ *   "OK:12345"       =  8 chars = 128 px  (x = 12 .. 139)
+ *   "ERR:12345"      =  9 chars = 144 px  (x = 12 .. 155)
+ * The counters are clamped to 99999 - see the note in LcdTask(); "%-5lu" is
+ * only a MINIMUM width, so without the clamp a longer count would push the
+ * text past the right edge and the address counter would wrap it to the left.
  * ------------------------------------------------------------------------- */
-#define UI_X            12U     /* left margin, shared by every line */
-#define UI_TITLE_Y      12U
-#define UI_TEMP_LBL_Y   64U
-#define UI_TEMP_VAL_Y   92U
-#define UI_HUMI_LBL_Y   136U
-#define UI_HUMI_VAL_Y   164U
-#define UI_STAT_Y       216U
-#define UI_CNT1_Y       256U
-#define UI_CNT2_Y       288U
+#define UI_HDR_H        29U     /* blue header bar                        */
+#define UI_TITLE_X      16U     /* centres the 13-char title in 240 px    */
+#define UI_TITLE_Y      2U
 
+#define UI_LBL_X        12U     /* captions, native font                  */
+#define UI_TEMP_LBL_Y   40U
+#define UI_HUMI_LBL_Y   144U
+
+#define UI_VAL_X        12U     /* readings, 2x font                      */
+#define UI_VAL_SCALE    2U
+#define UI_TEMP_VAL_Y   72U
+#define UI_HUMI_VAL_Y   176U
+
+#define UI_DIV_X0       12U     /* rules                                  */
+#define UI_DIV_X1       227U
+#define UI_DIV1_Y       132U
+#define UI_DIV2_Y       236U
+
+#define UI_LED_X0       12U     /* status square, left of the status text */
+#define UI_LED_Y0       250U
+#define UI_LED_X1       23U
+#define UI_LED_Y1       261U
+
+#define UI_STAT_X       30U
+#define UI_STAT_Y       244U
+
+/* One line per counter. Sharing a line does not work here: "OK:1234" plus
+ * "ERR:1234" is 15 characters = 240 px, which fills the whole screen with no
+ * gap and no margin, and the error counter alone needs 8 characters - placed
+ * at x = 128 that ends at 255 and wraps. Stacked, both keep the same 12 px
+ * left margin as every other row and still leave room for 5 digits. */
+#define UI_CNT_X        12U
+#define UI_CNT1_Y       272U
+#define UI_CNT2_Y       296U
+
+/* This layout is drawn for a 240x320 canvas. On this panel that is the MV=1
+ * pair (see the measurement table in lcd.h), so the guard below catches a
+ * switch to the 320x240 pair instead of silently letting the UI overflow. */
+#if ( LCD_W > LCD_H )
+#error "This UI is built for the 240x320 canvas. Set LCD_MADCTL to LCD_MADCTL_MV1_MX0_MY1 or LCD_MADCTL_MV1_MX1_MY0 in Core/BSP/lcd.h."
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -105,7 +155,7 @@ static void MX_FSMC_Init(void);
 /* USER CODE BEGIN PFP */
 static void Dht11Task( void *argument );    /* sampling: read DHT11 every 2 s */
 static void LcdTask( void *argument );      /* display: refresh on new data   */
-static void UI_DrawStatic( void );          /* draw the fixed labels          */
+static void UI_DrawStatic( void );          /* draw title bar and fixed text  */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -118,20 +168,32 @@ static void UI_DrawStatic( void )
 {
     LCD_Clear( LCD_COLOR_BG );
 
-    LCD_ShowString( UI_X, UI_TITLE_Y,    "DHT11 MONITOR", LCD_COLOR_TEXT );
-    LCD_ShowString( UI_X, UI_TEMP_LBL_Y, "Temperature",   LCD_COLOR_LABEL );
-    LCD_ShowString( UI_X, UI_HUMI_LBL_Y, "Humidity",      LCD_COLOR_LABEL );
+    /* Header bar. A dark panel on a black page has almost no visible edge, so
+     * a hairline is drawn along the bottom of the bar to separate the two. */
+    LCD_Fill( 0, 0, LCD_W - 1, UI_HDR_H - 1, LCD_COLOR_PANEL );
+    LCD_Fill( 0, UI_HDR_H - 1U, LCD_W - 1, UI_HDR_H - 1U, LCD_COLOR_EDGE );
+    LCD_ShowString( UI_TITLE_X, UI_TITLE_Y, "DHT11 MONITOR", LCD_COLOR_TITLE, LCD_COLOR_PANEL );
 
-    /* Placeholders, the same 6 characters as a real reading ("23.5 C"), so the
-     * first sample overwrites them without leaving anything behind. */
-    LCD_ShowString( UI_X, UI_TEMP_VAL_Y, "--.- C", LCD_COLOR_LABEL );
-    LCD_ShowString( UI_X, UI_HUMI_VAL_Y, "--.- %", LCD_COLOR_LABEL );
+    /* Captions. On a 240 px wide screen the two blocks cannot sit side by
+     * side ("TEMPERATURE" alone is 176 px), so they are stacked. */
+    LCD_ShowString( UI_LBL_X, UI_TEMP_LBL_Y, "TEMPERATURE", LCD_COLOR_LABEL, LCD_COLOR_BG );
+    LCD_ShowString( UI_LBL_X, UI_HUMI_LBL_Y, "HUMIDITY", LCD_COLOR_LABEL, LCD_COLOR_BG );
 
-    /* Exactly 12 characters, like "Status: OK  " and "Status: ERR " below, so
-     * all three states overwrite each other cleanly. */
-    LCD_ShowString( UI_X, UI_STAT_Y, "Status: WAIT", LCD_COLOR_WARN );
-    LCD_ShowString( UI_X, UI_CNT1_Y, "OK:0",  LCD_COLOR_LABEL );
-    LCD_ShowString( UI_X, UI_CNT2_Y, "ERR:0", LCD_COLOR_LABEL );
+    /* Horizontal rules, one under each block */
+    LCD_Fill( UI_DIV_X0, UI_DIV1_Y, UI_DIV_X1, UI_DIV1_Y + 1U, LCD_COLOR_EDGE );
+    LCD_Fill( UI_DIV_X0, UI_DIV2_Y, UI_DIV_X1, UI_DIV2_Y + 1U, LCD_COLOR_EDGE );
+
+    /* Placeholders, so the screen is not blank before the first sample.
+     * Same 6-character width as the real readings, otherwise the digits
+     * would not overwrite each other cleanly. */
+    LCD_ShowStringScale( UI_VAL_X, UI_TEMP_VAL_Y, "--.-  ", LCD_COLOR_LABEL, LCD_COLOR_BG, UI_VAL_SCALE );
+    LCD_ShowStringScale( UI_VAL_X, UI_HUMI_VAL_Y, "--.-  ", LCD_COLOR_LABEL, LCD_COLOR_BG, UI_VAL_SCALE );
+
+    /* Exactly 12 characters, same as "Status: OK  " and "Status: ERR " below,
+     * so all three states overwrite each other cleanly - and so the line ends
+     * at x = 221, inside the 240 px screen. */
+    LCD_ShowString( UI_STAT_X, UI_STAT_Y, "Status: WAIT", LCD_COLOR_WARN, LCD_COLOR_BG );
+    LCD_Fill( UI_LED_X0, UI_LED_Y0, UI_LED_X1, UI_LED_Y1, LCD_COLOR_WARN );
 }
 
 /**
@@ -176,7 +238,7 @@ static void Dht11Task( void *argument )
 static void LcdTask( void *argument )
 {
     DHT11_Data_t data;
-    char buf[ 16 ];         /* longest string is "ERR:9999" = 8 characters */
+    char buf[ 16 ];         /* longest string is "ERR:12345" = 9 characters */
     uint32_t okCnt  = 0U;
     uint32_t errCnt = 0U;
 
@@ -198,36 +260,40 @@ static void LcdTask( void *argument )
         {
             okCnt++;
 
-            /* "%2d.%d C" is always 6 characters (" 9.5 C" as well as "23.5 C"),
-             * so it overwrites the previous reading exactly. */
+            /* "%2d.%d C" is always exactly 6 characters (" 9.5 C" as well as
+             * "23.5 C"), so redrawing it over the previous value leaves
+             * nothing behind and no padding is needed. */
             snprintf( buf, sizeof( buf ), "%2d.%d C", data.temp_int, data.temp_dec );
-            LCD_ShowString( UI_X, UI_TEMP_VAL_Y, buf, LCD_COLOR_TEMP );
+            LCD_ShowStringScale( UI_VAL_X, UI_TEMP_VAL_Y, buf, LCD_COLOR_TEMP, LCD_COLOR_BG, UI_VAL_SCALE );
 
             snprintf( buf, sizeof( buf ), "%2d.%d %%", data.humi_int, data.humi_dec );
-            LCD_ShowString( UI_X, UI_HUMI_VAL_Y, buf, LCD_COLOR_HUMI );
+            LCD_ShowStringScale( UI_VAL_X, UI_HUMI_VAL_Y, buf, LCD_COLOR_HUMI, LCD_COLOR_BG, UI_VAL_SCALE );
 
-            LCD_ShowString( UI_X, UI_STAT_Y, "Status: OK  ", LCD_COLOR_OK );
+            LCD_ShowString( UI_STAT_X, UI_STAT_Y, "Status: OK  ", LCD_COLOR_OK, LCD_COLOR_BG );
+            LCD_Fill( UI_LED_X0, UI_LED_Y0, UI_LED_X1, UI_LED_Y1, LCD_COLOR_OK );
         }
         else
         {
             errCnt++;
 
-            /* The same 6 characters as a real reading, so the error text erases
-             * the old value instead of leaving a stray digit behind. */
-            LCD_ShowString( UI_X, UI_TEMP_VAL_Y, "--.- C", LCD_COLOR_ERR );
-            LCD_ShowString( UI_X, UI_HUMI_VAL_Y, "--.- %", LCD_COLOR_ERR );
+            /* Same 6-character width as a real reading, so the error text
+             * erases the value instead of leaving a stray digit behind */
+            LCD_ShowStringScale( UI_VAL_X, UI_TEMP_VAL_Y, "--.-  ", LCD_COLOR_ERR, LCD_COLOR_BG, UI_VAL_SCALE );
+            LCD_ShowStringScale( UI_VAL_X, UI_HUMI_VAL_Y, "--.-  ", LCD_COLOR_ERR, LCD_COLOR_BG, UI_VAL_SCALE );
 
-            LCD_ShowString( UI_X, UI_STAT_Y, "Status: ERR ", LCD_COLOR_ERR );
+            LCD_ShowString( UI_STAT_X, UI_STAT_Y, "Status: ERR ", LCD_COLOR_ERR, LCD_COLOR_BG );
+            LCD_Fill( UI_LED_X0, UI_LED_Y0, UI_LED_X1, UI_LED_Y1, LCD_COLOR_ERR );
         }
 
-        /* "%-4lu" is a MINIMUM width, so a longer count would grow the string
-         * and push it past the right edge, where the address counter wraps it
-         * back to the left as garbage. The screen shows at most 9999. */
-        snprintf( buf, sizeof( buf ), "OK:%-4lu",  ( okCnt  > 9999UL ) ? 9999UL : okCnt );
-        LCD_ShowString( UI_X, UI_CNT1_Y, buf, LCD_COLOR_LABEL );
+        /* One counter per line. "%-5lu" is only a MINIMUM width, so a longer
+         * count would grow the string and push it past the right edge, where
+         * the address counter wraps it back to the left as garbage. The screen
+         * therefore shows at most 99999; the real counters keep running. */
+        snprintf( buf, sizeof( buf ), "OK:%-5lu",  ( okCnt  > 99999UL ) ? 99999UL : okCnt );
+        LCD_ShowString( UI_CNT_X, UI_CNT1_Y, buf, LCD_COLOR_MUTED, LCD_COLOR_BG );
 
-        snprintf( buf, sizeof( buf ), "ERR:%-4lu", ( errCnt > 9999UL ) ? 9999UL : errCnt );
-        LCD_ShowString( UI_X, UI_CNT2_Y, buf, LCD_COLOR_LABEL );
+        snprintf( buf, sizeof( buf ), "ERR:%-5lu", ( errCnt > 99999UL ) ? 99999UL : errCnt );
+        LCD_ShowString( UI_CNT_X, UI_CNT2_Y, buf, LCD_COLOR_MUTED, LCD_COLOR_BG );
     }
 }
 

@@ -142,8 +142,9 @@ void UsageFault_Handler(void)
 /**
   * @brief This function handles System service call via SWI instruction.
   */
-/* SVC_Handler 由 FreeRTOS 移植层提供, 这里必须删掉否则 multiple definition
- * CubeMX 重新生成会再加回来, 记得再删一次。
+/* SVC_Handler is provided by the FreeRTOS port; it must be deleted here
+ * or you get a multiple definition error. CubeMX adds it back on every
+ * regenerate - remember to delete it again.
 void SVC_Handler(void)
 {
 }
@@ -165,7 +166,7 @@ void DebugMon_Handler(void)
 /**
   * @brief This function handles Pendable request for system service.
   */
-/* PendSV_Handler 由 FreeRTOS 移植层提供
+/* PendSV_Handler is provided by the FreeRTOS port
 void PendSV_Handler(void)
 {
 }
@@ -174,7 +175,7 @@ void PendSV_Handler(void)
 /**
   * @brief This function handles System tick timer.
   */
-/* SysTick_Handler 由 FreeRTOS 移植层提供
+/* SysTick_Handler is provided by the FreeRTOS port
 void SysTick_Handler(void)
 {
 }

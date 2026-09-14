@@ -1,45 +1,57 @@
 #include "lcd.h"
 #include "lcdfont.h"
 
-/* ------------------------------------------------------------------ */
-/* 底层: FSMC 读写                                                     */
-/* ------------------------------------------------------------------ */
-
-static inline void LCD_WriteCmd( uint16_t cmd )
+/* ---------------------------------------------------------------------------
+ * The two addresses the panel exposes on the bus
+ * ---------------------------------------------------------------------------
+ * Writing LCD_REG sends a command, writing LCD_RAM pushes one parameter or one
+ * pixel. Which one you hit is decided purely by address bit 11 (see lcd.h), so
+ * these two functions are the whole hardware interface.
+ * ------------------------------------------------------------------------- */
+static void LCD_WriteCmd( uint16_t cmd )
 {
     LCD->LCD_REG = cmd;
 }
 
-static inline void LCD_WriteData( uint16_t data )
+static void LCD_WriteData( uint16_t data )
 {
     LCD->LCD_RAM = data;
 }
 
-static inline uint16_t LCD_ReadData( void )
+/* ---------------------------------------------------------------------------
+ * Open a rectangle
+ * ---------------------------------------------------------------------------
+ * 0x2A sets the column range, 0x2B the page range, and 0x2C says "every write
+ * from now on is a pixel". The controller then walks the rectangle by itself,
+ * so a whole area is filled without ever sending a coordinate again.
+ * ------------------------------------------------------------------------- */
+static void LCD_SetWindow( uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1 )
 {
-    return LCD->LCD_RAM;
+    LCD_WriteCmd( 0x2A );                       /* column address set */
+    LCD_WriteData( x0 >> 8 ); LCD_WriteData( x0 & 0xFF );
+    LCD_WriteData( x1 >> 8 ); LCD_WriteData( x1 & 0xFF );
+
+    LCD_WriteCmd( 0x2B );                       /* page address set */
+    LCD_WriteData( y0 >> 8 ); LCD_WriteData( y0 & 0xFF );
+    LCD_WriteData( y1 >> 8 ); LCD_WriteData( y1 & 0xFF );
+
+    LCD_WriteCmd( 0x2C );                       /* memory write */
 }
 
-static void LCD_SetWindow( uint16_t xs, uint16_t ys, uint16_t xe, uint16_t ye )
-{
-    LCD_WriteCmd( 0x2A );                       /* Column address set */
-    LCD_WriteData( xs >> 8 ); LCD_WriteData( xs & 0xFF );
-    LCD_WriteData( xe >> 8 ); LCD_WriteData( xe & 0xFF );
-
-    LCD_WriteCmd( 0x2B );                       /* Page address set */
-    LCD_WriteData( ys >> 8 ); LCD_WriteData( ys & 0xFF );
-    LCD_WriteData( ye >> 8 ); LCD_WriteData( ye & 0xFF );
-
-    LCD_WriteCmd( 0x2C );                       /* Memory write */
-}
-
-/* ------------------------------------------------------------------ */
-/* ILI9341 初始化序列                                                  */
-/* ------------------------------------------------------------------ */
-
+/* ---------------------------------------------------------------------------
+ * Panel configuration
+ * ---------------------------------------------------------------------------
+ * Almost all of this is the vendor's magic numbers; there is nothing to
+ * understand and no reason to touch it. Only three settings matter, and all
+ * three come from lcd.h:
+ *
+ *   0x36 MADCTL      orientation and RGB order
+ *   0x3A COLMOD      0x55 = 16 bits per pixel, matching the FSMC bus
+ *   0x20 / 0x21      colour polarity of the panel
+ * ------------------------------------------------------------------------- */
 static void ILI9341_Init( void )
 {
-    LCD_WriteCmd( 0x01 );                       /* Software reset */
+    LCD_WriteCmd( 0x01 );                       /* software reset */
     HAL_Delay( 120 );
 
     LCD_WriteCmd( 0xCF );
@@ -61,10 +73,10 @@ static void ILI9341_Init( void )
     LCD_WriteCmd( 0xEA );
     LCD_WriteData( 0x00 ); LCD_WriteData( 0x00 );
 
-    LCD_WriteCmd( 0xC0 );                       /* Power control 1 */
+    LCD_WriteCmd( 0xC0 );                       /* power control 1 */
     LCD_WriteData( 0x1B );
 
-    LCD_WriteCmd( 0xC1 );                       /* Power control 2 */
+    LCD_WriteCmd( 0xC1 );                       /* power control 2 */
     LCD_WriteData( 0x01 );
 
     LCD_WriteCmd( 0xC5 );                       /* VCOM control 1 */
@@ -73,54 +85,55 @@ static void ILI9341_Init( void )
     LCD_WriteCmd( 0xC7 );                       /* VCOM control 2 */
     LCD_WriteData( 0xB7 );
 
-    LCD_WriteCmd( 0x36 );                       /* Memory access control */
-    LCD_WriteData( 0x08 );                      /* 竖屏, 自上而下, BGR 顺序 */
+    LCD_WriteCmd( 0x36 );                       /* orientation, see lcd.h */
+    LCD_WriteData( LCD_MADCTL );
 
-    LCD_WriteCmd( 0x3A );                       /* Pixel format */
-    LCD_WriteData( 0x55 );                      /* 16 bit / pixel (RGB565) */
+    LCD_WriteCmd( 0x3A );                       /* pixel format */
+    LCD_WriteData( 0x55 );                      /* 16 bit / pixel */
 
-    LCD_WriteCmd( 0xB1 );                       /* Frame rate control */
+    LCD_WriteCmd( LCD_INVERSION );              /* colour polarity, see lcd.h */
+
+    LCD_WriteCmd( 0xB1 );                       /* frame rate */
     LCD_WriteData( 0x00 ); LCD_WriteData( 0x1B );
 
-    LCD_WriteCmd( 0xB6 );                       /* Display function control */
+    LCD_WriteCmd( 0xB6 );                       /* display function */
     LCD_WriteData( 0x0A ); LCD_WriteData( 0xA2 );
 
-    LCD_WriteCmd( 0xF2 );                       /* Enable 3 gamma */
+    LCD_WriteCmd( 0xF2 );                       /* 3 gamma function */
     LCD_WriteData( 0x00 );
 
-    LCD_WriteCmd( 0x26 );                       /* Gamma set */
+    LCD_WriteCmd( 0x26 );                       /* gamma curve */
     LCD_WriteData( 0x01 );
 
-    LCD_WriteCmd( 0xE0 );                       /* Positive gamma correction */
+    LCD_WriteCmd( 0xE0 );                       /* positive gamma */
     LCD_WriteData( 0x0F ); LCD_WriteData( 0x31 ); LCD_WriteData( 0x2B ); LCD_WriteData( 0x0C );
     LCD_WriteData( 0x0E ); LCD_WriteData( 0x08 ); LCD_WriteData( 0x4E ); LCD_WriteData( 0xF1 );
     LCD_WriteData( 0x37 ); LCD_WriteData( 0x07 ); LCD_WriteData( 0x10 ); LCD_WriteData( 0x03 );
     LCD_WriteData( 0x0E ); LCD_WriteData( 0x09 ); LCD_WriteData( 0x00 );
 
-    LCD_WriteCmd( 0xE1 );                       /* Negative gamma correction */
+    LCD_WriteCmd( 0xE1 );                       /* negative gamma */
     LCD_WriteData( 0x00 ); LCD_WriteData( 0x0E ); LCD_WriteData( 0x14 ); LCD_WriteData( 0x03 );
     LCD_WriteData( 0x11 ); LCD_WriteData( 0x07 ); LCD_WriteData( 0x31 ); LCD_WriteData( 0xC1 );
     LCD_WriteData( 0x48 ); LCD_WriteData( 0x08 ); LCD_WriteData( 0x0F ); LCD_WriteData( 0x0C );
     LCD_WriteData( 0x31 ); LCD_WriteData( 0x36 ); LCD_WriteData( 0x0F );
 
-    LCD_WriteCmd( 0x11 );                       /* Sleep out */
-    HAL_Delay( 120 );
+    LCD_WriteCmd( 0x11 );                       /* sleep out */
+    HAL_Delay( 120 );                           /* wait for the charge pump */
 
-    LCD_WriteCmd( 0x29 );                       /* Display on */
+    LCD_WriteCmd( 0x29 );                       /* display on */
 }
 
-/* ------------------------------------------------------------------ */
-/* 对外接口                                                            */
-/* ------------------------------------------------------------------ */
+/* ---------------------------------------------------------------------------
+ * Public API
+ * ------------------------------------------------------------------------- */
 
 void LCD_Init( void )
 {
     ILI9341_Init();
 
-    /* 打开背光 */
     HAL_GPIO_WritePin( LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_SET );
 
-    LCD_Clear( LCD_COLOR_BLACK );
+    LCD_Clear( LCD_COLOR_BG );
 }
 
 void LCD_Clear( uint16_t color )
@@ -133,28 +146,14 @@ void LCD_Clear( uint16_t color )
     }
 }
 
-void LCD_Fill( uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color )
-{
-    if( x1 >= LCD_W ) x1 = LCD_W - 1;
-    if( y1 >= LCD_H ) y1 = LCD_H - 1;
-
-    LCD_SetWindow( x0, y0, x1, y1 );
-
-    uint32_t n = ( uint32_t ) ( x1 - x0 + 1 ) * ( y1 - y0 + 1 );
-
-    for( uint32_t i = 0; i < n; i++ )
-    {
-        LCD_WriteData( color );
-    }
-}
-
-void LCD_DrawPoint( uint16_t x, uint16_t y, uint16_t color )
-{
-    LCD_SetWindow( x, y, x, y );
-    LCD_WriteData( color );
-}
-
-void LCD_ShowChar( uint16_t x, uint16_t y, char ch, uint16_t fg, uint16_t bg )
+/* ---------------------------------------------------------------------------
+ * One character
+ * ---------------------------------------------------------------------------
+ * The font stores each glyph as 24 rows of 2 bytes = 16 bits, with the MSB
+ * being the leftmost pixel. So a row is decoded by testing one bit at a time:
+ * bit set -> ink, bit clear -> background.
+ * ------------------------------------------------------------------------- */
+static void LCD_ShowChar( uint16_t x, uint16_t y, char ch, uint16_t color )
 {
     if( ch < 0x20 || ch > 0x7E )
     {
@@ -163,7 +162,8 @@ void LCD_ShowChar( uint16_t x, uint16_t y, char ch, uint16_t fg, uint16_t bg )
 
     const uint8_t *p = ascii_16x24[ ( uint8_t ) ch - 0x20 ];
 
-    LCD_SetWindow( x, y, x + FONT_W - 1, y + FONT_H - 1 );
+    /* One window per character, then stream its 16 x 24 pixels into it */
+    LCD_SetWindow( x, y, x + FONT_W - 1U, y + FONT_H - 1U );
 
     for( uint8_t row = 0; row < FONT_H; row++ )
     {
@@ -171,43 +171,17 @@ void LCD_ShowChar( uint16_t x, uint16_t y, char ch, uint16_t fg, uint16_t bg )
 
         for( uint8_t col = 0; col < FONT_W; col++ )
         {
-            LCD_WriteData( ( bits & ( 0x8000 >> col ) ) ? fg : bg );
+            LCD_WriteData( ( bits & ( 0x8000U >> col ) ) ? color : LCD_COLOR_BG );
         }
     }
 }
 
-void LCD_ShowString( uint16_t x, uint16_t y, const char *str, uint16_t fg, uint16_t bg )
+void LCD_ShowString( uint16_t x, uint16_t y, const char *str, uint16_t color )
 {
-    uint16_t cur = x;
-
     while( *str )
     {
-        if( *str == '\n' )
-        {
-            y += FONT_H;
-            cur = x;
-        }
-        else
-        {
-            LCD_ShowChar( cur, y, *str, fg, bg );
-            cur += FONT_W;
-            if( cur + FONT_W > LCD_W )
-            {
-                cur = x;
-                y += FONT_H;
-            }
-        }
+        LCD_ShowChar( x, y, *str, color );
+        x += FONT_W;
         str++;
     }
-}
-
-/* 保留, 读 ID 时可用 */
-uint16_t LCD_ReadID( void )
-{
-    LCD_WriteCmd( 0xD3 );
-    LCD_ReadData();                 /* 空读一次 */
-    LCD_ReadData();
-    uint16_t id = LCD_ReadData() << 8;
-    id |= LCD_ReadData();
-    return id;                      /* ILI9341 应返回 0x9341 */
 }
