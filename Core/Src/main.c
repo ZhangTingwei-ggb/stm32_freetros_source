@@ -29,6 +29,12 @@
 
 #include "lcd.h"
 #include "dht11.h"
+#include "app_shared.h"
+#include "bsp_adc.h"
+#include "bsp_uart_dma.h"
+#include "param_storage.h"
+#include "custom_protocol.h"
+#include "modbus_rtu.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,15 +48,22 @@
  * tasks; 256 leaves a comfortable margin. */
 #define TASK_STACK_DEPTH        256U
 
-/* Priorities: the sampling task sits above the display task.
- * Both tasks are driven by "read from / write to the queue", so
- * letting the sampler run first guarantees no sample is dropped. */
+/* Priorities: sampler > uart protocol > display.
+ * The sampler runs first so no sample is dropped; the uart task sits above
+ * display so command responses stay fast (< 10 ms, doc 9.3). */
 #define DHT11_TASK_PRIO         3U
+#define UART_TASK_PRIO          4U
 #define LCD_TASK_PRIO           2U
 
-/* The DHT11 datasheet asks for >= 1 s between samples; we use 2 s,
- * which makes the sensor more stable */
-#define DHT11_PERIOD_MS         2000U
+/* Sampling period is no longer a fixed macro: it comes from Flash params
+ * (Param_GetPeriodMs, default 2000 ms, 500~60000 ms via protocol).
+ * DHT11 datasheet asks for >= 1 s between samples. */
+#define UART_TASK_STACK_DEPTH   256U
+
+/* USART1 single-port baud. Doc says custom 115200 + Modbus 9600, but the
+ * board has only one USART1, so both protocols share 115200 (see bsp_uart_dma.h).
+ * The Modbus master must also use 115200. */
+#define UART_BAUD               115200U
 
 /* ---------------------------------------------------------------------------
  * UI layout - PORTRAIT 240 x 320
@@ -58,24 +71,26 @@
  * The font is 16 x 24 px, so a 240 px line holds 15 characters. That is the
  * only real constraint here: every string below has to end before x = 239.
  *
- *   12   DHT11 MONITOR     heading
- *   64   Temperature       caption
- *   92   23.5 C            reading
- *  136   Humidity          caption
- *  164   45.0 %            reading
- *  216   Status: OK        status line
- *  256   OK:12             counters, one per line
- *  288   ERR:0
+ *   8    DHT11 MONITOR     heading (13 chars)
+ *   44   Temperature       caption
+ *   72   23.5 C            reading (6 chars, fixed)
+ *   108  Humidity          caption
+ *   136  45.0 %            reading (6 chars, fixed)
+ *   172  Voltage           caption
+ *   200  3.30 V            reading (6 chars, fixed)
+ *   236  Status: OK        status line (12 chars, fixed)
+ *   272  OK:12   E:0       counters, one line, 14 chars fixed
  * ------------------------------------------------------------------------- */
 #define UI_X            12U     /* left margin, shared by every line */
-#define UI_TITLE_Y      12U
-#define UI_TEMP_LBL_Y   64U
-#define UI_TEMP_VAL_Y   92U
-#define UI_HUMI_LBL_Y   136U
-#define UI_HUMI_VAL_Y   164U
-#define UI_STAT_Y       216U
-#define UI_CNT1_Y       256U
-#define UI_CNT2_Y       288U
+#define UI_TITLE_Y      8U
+#define UI_TEMP_LBL_Y   44U
+#define UI_TEMP_VAL_Y   72U
+#define UI_HUMI_LBL_Y   108U
+#define UI_HUMI_VAL_Y   136U
+#define UI_VOLT_LBL_Y   172U
+#define UI_VOLT_VAL_Y   200U
+#define UI_STAT_Y       236U
+#define UI_CNT_Y        272U
 
 /* USER CODE END PD */
 
@@ -87,12 +102,14 @@
 SRAM_HandleTypeDef hsram1;
 
 /* USER CODE BEGIN PV */
-/* Data channel: sampling task -> display task.
- * Length is 1 and it is used together with xQueueOverwrite, so it
- * always holds the newest sample only. That is the ideal model for a
- * sensor: nobody cares about stale readings, and the queue can never
- * pile up just because the display task was slow once. */
-static QueueHandle_t dhtQueue = NULL;
+/* Data channels, defined here (declared in app_shared.h):
+ * q_sensor2display: depth 1 + xQueueOverwrite, always newest sample only.
+ * q_sensor2uart: depth 5, upload frames queue up if the uart task is busy.
+ * g_latest: newest sample snapshot for the Modbus task (single writer). */
+QueueHandle_t        q_sensor2display = NULL;
+QueueHandle_t        q_sensor2uart    = NULL;
+TaskHandle_t         uartTaskHandle   = NULL;
+volatile SensorData_t g_latest = { 0, 0, 0, 0, 0 };
 
 static TaskHandle_t  dht11TaskHandle = NULL;
 static TaskHandle_t  lcdTaskHandle   = NULL;
@@ -103,8 +120,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_FSMC_Init(void);
 /* USER CODE BEGIN PFP */
-static void Dht11Task( void *argument );    /* sampling: read DHT11 every 2 s */
+static void Dht11Task( void *argument );    /* sampling: DHT11 + ADC */
 static void LcdTask( void *argument );      /* display: refresh on new data   */
+static void UartTask( void *argument );     /* custom protocol + Modbus slave */
 static void UI_DrawStatic( void );          /* draw the fixed labels          */
 /* USER CODE END PFP */
 
@@ -116,22 +134,28 @@ static void UI_DrawStatic( void );          /* draw the fixed labels          */
   */
 static void UI_DrawStatic( void )
 {
+    char cnt[ 16 ];
+
     LCD_Clear( LCD_COLOR_BG );
 
     LCD_ShowString( UI_X, UI_TITLE_Y,    "DHT11 MONITOR", LCD_COLOR_TEXT );
     LCD_ShowString( UI_X, UI_TEMP_LBL_Y, "Temperature",   LCD_COLOR_LABEL );
     LCD_ShowString( UI_X, UI_HUMI_LBL_Y, "Humidity",      LCD_COLOR_LABEL );
+    LCD_ShowString( UI_X, UI_VOLT_LBL_Y, "Voltage",       LCD_COLOR_LABEL );
 
-    /* Placeholders, the same 6 characters as a real reading ("23.5 C"), so the
+    /* Placeholders, each exactly as long as a real reading (6 chars), so the
      * first sample overwrites them without leaving anything behind. */
     LCD_ShowString( UI_X, UI_TEMP_VAL_Y, "--.- C", LCD_COLOR_LABEL );
     LCD_ShowString( UI_X, UI_HUMI_VAL_Y, "--.- %", LCD_COLOR_LABEL );
+    LCD_ShowString( UI_X, UI_VOLT_VAL_Y, "-.-- V", LCD_COLOR_LABEL );
 
     /* Exactly 12 characters, like "Status: OK  " and "Status: ERR " below, so
      * all three states overwrite each other cleanly. */
     LCD_ShowString( UI_X, UI_STAT_Y, "Status: WAIT", LCD_COLOR_WARN );
-    LCD_ShowString( UI_X, UI_CNT1_Y, "OK:0",  LCD_COLOR_LABEL );
-    LCD_ShowString( UI_X, UI_CNT2_Y, "ERR:0", LCD_COLOR_LABEL );
+
+    /* 14 chars fixed, same format string as the live counters below. */
+    snprintf( cnt, sizeof( cnt ), "OK:%-4lu E:%-4lu", 0UL, 0UL );
+    LCD_ShowString( UI_X, UI_CNT_Y, cnt, LCD_COLOR_LABEL );
 }
 
 /**
@@ -142,7 +166,8 @@ static void UI_DrawStatic( void )
   */
 static void Dht11Task( void *argument )
 {
-    DHT11_Data_t data;
+    DHT11_Data_t dht;
+    SensorData_t data;
 
     ( void ) argument;
 
@@ -153,20 +178,34 @@ static void Dht11Task( void *argument )
     {
         /* A failed read is still forwarded, so the screen shows an error state
          * instead of freezing on the last good value */
-        if( DHT11_Read( &data ) == 0U )
+        if( DHT11_Read( &dht ) == 0U )
         {
-            data.humi_int = 0U;
-            data.humi_dec = 0U;
-            data.temp_int = 0U;
-            data.temp_dec = 0U;
+            data.temp_x10 = 0;
+            data.humi_x10 = 0U;
             data.valid    = 0U;
         }
+        else
+        {
+            data.temp_x10 = ( int16_t )( ( int16_t ) dht.temp_int * 10 +
+                                         dht.temp_dec );
+            data.humi_x10 = ( uint16_t )( ( uint16_t ) dht.humi_int * 10U +
+                                          dht.humi_dec );
+            data.valid    = 1U;
+        }
 
-        /* Push into the queue. Length is 1 and we use Overwrite, so this
-         * call can never block. */
-        xQueueOverwrite( dhtQueue, &data );
+        /* ADC 电位器电压, 每次采样都读, 和温湿度打进同一个包 */
+        data.volt_mv  = BSP_ADC_ToMillivolt( BSP_ADC_ReadRaw() );
+        data.timestamp = xTaskGetTickCount();
 
-        vTaskDelay( pdMS_TO_TICKS( DHT11_PERIOD_MS ) );
+        g_latest = data;    /* Modbus 从站直接读这份快照 */
+
+        /* Display queue: depth 1 + Overwrite, never blocks. Uart queue:
+         * depth 5, drop (0 timeout) if the uart task is backed up. */
+        xQueueOverwrite( q_sensor2display, &data );
+        xQueueSend( q_sensor2uart, &data, 0 );
+
+        /* 周期来自 Flash 参数, 上位机/Modbus 可改, 下次循环生效 */
+        vTaskDelay( pdMS_TO_TICKS( Param_GetPeriodMs() ) );
     }
 }
 
@@ -175,8 +214,8 @@ static void Dht11Task( void *argument )
   */
 static void LcdTask( void *argument )
 {
-    DHT11_Data_t data;
-    char buf[ 16 ];         /* longest string is "ERR:9999" = 8 characters */
+    SensorData_t data;
+    char buf[ 16 ];         /* longest string is "OK:9999 E:9999" = 14 chars */
     uint32_t okCnt  = 0U;
     uint32_t errCnt = 0U;
 
@@ -189,10 +228,15 @@ static void LcdTask( void *argument )
     for( ;; )
     {
         /* Block here while there is no data: costs no CPU */
-        if( xQueueReceive( dhtQueue, &data, portMAX_DELAY ) != pdPASS )
+        if( xQueueReceive( q_sensor2display, &data, portMAX_DELAY ) != pdPASS )
         {
             continue;
         }
+
+        /* Voltage is shown on every refresh, good or bad sample alike. */
+        snprintf( buf, sizeof( buf ), "%d.%02d V",
+                  data.volt_mv / 1000U, ( data.volt_mv % 1000U ) / 10U );
+        LCD_ShowString( UI_X, UI_VOLT_VAL_Y, buf, LCD_COLOR_TEXT );
 
         if( data.valid != 0U )
         {
@@ -200,10 +244,12 @@ static void LcdTask( void *argument )
 
             /* "%2d.%d C" is always 6 characters (" 9.5 C" as well as "23.5 C"),
              * so it overwrites the previous reading exactly. */
-            snprintf( buf, sizeof( buf ), "%2d.%d C", data.temp_int, data.temp_dec );
+            snprintf( buf, sizeof( buf ), "%2d.%d C",
+                      data.temp_x10 / 10, data.temp_x10 % 10 );
             LCD_ShowString( UI_X, UI_TEMP_VAL_Y, buf, LCD_COLOR_TEMP );
 
-            snprintf( buf, sizeof( buf ), "%2d.%d %%", data.humi_int, data.humi_dec );
+            snprintf( buf, sizeof( buf ), "%2d.%d %%",
+                      data.humi_x10 / 10U, data.humi_x10 % 10U );
             LCD_ShowString( UI_X, UI_HUMI_VAL_Y, buf, LCD_COLOR_HUMI );
 
             LCD_ShowString( UI_X, UI_STAT_Y, "Status: OK  ", LCD_COLOR_OK );
@@ -220,14 +266,138 @@ static void LcdTask( void *argument )
             LCD_ShowString( UI_X, UI_STAT_Y, "Status: ERR ", LCD_COLOR_ERR );
         }
 
-        /* "%-4lu" is a MINIMUM width, so a longer count would grow the string
-         * and push it past the right edge, where the address counter wraps it
-         * back to the left as garbage. The screen shows at most 9999. */
-        snprintf( buf, sizeof( buf ), "OK:%-4lu",  ( okCnt  > 9999UL ) ? 9999UL : okCnt );
-        LCD_ShowString( UI_X, UI_CNT1_Y, buf, LCD_COLOR_LABEL );
+        /* Fixed 14 chars ("OK:12   E:0   "): "%-4lu" is a MINIMUM width, so a
+         * longer count would push past the right edge where the address
+         * counter wraps it back left as garbage. Clamp at 9999. */
+        snprintf( buf, sizeof( buf ), "OK:%-4lu E:%-4lu",
+                  ( okCnt  > 9999UL ) ? 9999UL : okCnt,
+                  ( errCnt > 9999UL ) ? 9999UL : errCnt );
+        LCD_ShowString( UI_X, UI_CNT_Y, buf, LCD_COLOR_LABEL );
+    }
+}
 
-        snprintf( buf, sizeof( buf ), "ERR:%-4lu", ( errCnt > 9999UL ) ? 9999UL : errCnt );
-        LCD_ShowString( UI_X, UI_CNT2_Y, buf, LCD_COLOR_LABEL );
+/**
+  * @brief  Uart task: one USART1 serves two protocols (doc 4.3 + 6.x).
+  * @note   TX: each sensor sample goes out as a custom 0x01 upload frame.
+  *         RX: bytes starting with 0xAA go to the custom-protocol state
+  *         machine, everything else is collected with a 10 ms silence gap
+  *         and treated as a Modbus RTU frame.
+  */
+#define UART_STAGE_SIZE   96U
+
+static void UartTask( void *argument )
+{
+    CProto_Parser_t cproto;
+    static uint8_t  stage[ UART_STAGE_SIZE ];   /* static: keep task stack small */
+    static uint16_t stageLen = 0U;
+    uint8_t  rx[ 64 ];
+    uint8_t  tx[ 96 ];
+    SensorData_t s;
+
+    ( void ) argument;
+
+    CProto_ParserInit( &cproto );
+
+    for( ;; )
+    {
+        /* Sleep until the IDLE ISR knocks, or 20 ms timeout to drain uploads */
+        ulTaskNotifyTake( pdTRUE, pdMS_TO_TICKS( 20 ) );
+
+        /* 1) 上报: 每个采样一帧 0x01, 发完再看有没有堆积的 */
+        while( xQueueReceive( q_sensor2uart, &s, 0 ) == pdPASS )
+        {
+            uint16_t n = CProto_BuildUpload( &s, tx, sizeof( tx ) );
+
+            if( n > 0U )
+            {
+                BSP_UART_Send( tx, n );
+            }
+        }
+
+        /* 2) 收字节并分流: 自定义帧逐字节喂状态机, 其余攒进 stage */
+        uint16_t n = BSP_UART_ReadBytes( rx, sizeof( rx ) );
+
+        for( uint16_t i = 0U; i < n; i++ )
+        {
+            uint8_t b = rx[ i ];
+
+            if( CProto_InFrame( &cproto ) )
+            {
+                uint16_t rl = 0U;
+
+                if( CProto_ParseByte( &cproto, b, tx, &rl ) && rl > 0U )
+                {
+                    BSP_UART_Send( tx, rl );    /* 只 0x03 查询有应答 */
+                }
+            }
+            else if( stageLen == 0U && b == CPROTO_HEAD )
+            {
+                uint16_t rl = 0U;
+
+                /* 帧头另起一帧, 不进 Modbus 暂存 */
+                if( CProto_ParseByte( &cproto, b, tx, &rl ) && rl > 0U )
+                {
+                    BSP_UART_Send( tx, rl );
+                }
+            }
+            else if( stageLen < UART_STAGE_SIZE )
+            {
+                stage[ stageLen++ ] = b;
+            }
+            else
+            {
+                stageLen = 0U;  /* 溢出: 之前攒的肯定不是合法帧, 扔掉重来 */
+            }
+        }
+
+        /* 3) Modbus: 10 ms 静默 = 一帧收齐, 当帧处理 (TIM4 超时用空闲代替) */
+        if( stageLen >= 4U )
+        {
+            vTaskDelay( pdMS_TO_TICKS( 10 ) );
+
+            uint16_t m = BSP_UART_ReadBytes( rx, sizeof( rx ) );
+            uint16_t added = 0U;
+
+            for( uint16_t i = 0U; i < m; i++ )
+            {
+                uint8_t b = rx[ i ];
+
+                if( CProto_InFrame( &cproto ) ||
+                    ( stageLen == 0U && b == CPROTO_HEAD ) )
+                {
+                    uint16_t rl = 0U;
+
+                    if( CProto_ParseByte( &cproto, b, tx, &rl ) && rl > 0U )
+                    {
+                        BSP_UART_Send( tx, rl );
+                    }
+                }
+                else if( stageLen < UART_STAGE_SIZE )
+                {
+                    stage[ stageLen++ ] = b;
+                    added++;
+                }
+                else
+                {
+                    stageLen = 0U;
+                    added    = 1U;
+                    break;
+                }
+            }
+
+            if( added == 0U )
+            {
+                uint16_t rl = Modbus_Process( stage, stageLen, tx, sizeof( tx ) );
+
+                if( rl > 0U )
+                {
+                    BSP_UART_Send( tx, rl );    /* 广播/地址不符返回 0, 不发 */
+                }
+
+                stageLen = 0U;
+            }
+            /* 还有新字节进来: 说明帧没收完, 下一轮循环继续等静默 */
+        }
     }
 }
 
@@ -241,8 +411,10 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  /* The queue has to be created before both tasks are started */
-  dhtQueue = xQueueCreate( 1, sizeof( DHT11_Data_t ) );
+  /* Queues must exist before the tasks start. Display queue depth 1
+   * (newest-only), uart upload queue depth 5 (doc 4.4). */
+  q_sensor2display = xQueueCreate( 1, sizeof( SensorData_t ) );
+  q_sensor2uart    = xQueueCreate( 5, sizeof( SensorData_t ) );
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -268,12 +440,22 @@ int main(void)
   /* Note: after enabling FSMC in CubeMX and regenerating the project,
    * CubeMX inserts the declaration and the call of MX_FSMC_Init() right
    * after MX_GPIO_Init() on its own - no need to write it by hand.
-   * Calling LCD_Init() before the FSMC is up has no effect. */
+   * Calling LCD_Init() before the FSMC is up has no effect.
+   *
+   * ADC1 (PA1) and USART1 (PA9/PA10 + DMA1 Ch5) are NOT in Source.ioc -
+   * their init lives in BSP (bsp_adc.c / bsp_uart_dma.c) so a CubeMX
+   * regenerate cannot wipe them. If you add them in CubeMX later, remove
+   * the hand init here to avoid double configuration. */
 
-  if( dhtQueue != NULL )
+  Param_Load();                 /* Flash 参数 -> 内存, 坏块则默认值 */
+  BSP_ADC_Init();               /* 电位器 ADC, 无 RTOS 调用, 调度器前可调 */
+  BSP_UART_Init( UART_BAUD );   /* DMA 接收 + 空闲中断, 中断里已判调度器状态 */
+
+  if( q_sensor2display != NULL && q_sensor2uart != NULL )
   {
       xTaskCreate( Dht11Task, "dht11", TASK_STACK_DEPTH, NULL, DHT11_TASK_PRIO, &dht11TaskHandle );
       xTaskCreate( LcdTask,   "lcd",   TASK_STACK_DEPTH, NULL, LCD_TASK_PRIO,   &lcdTaskHandle );
+      xTaskCreate( UartTask,  "uart",  UART_TASK_STACK_DEPTH, NULL, UART_TASK_PRIO, &uartTaskHandle );
 
       vTaskStartScheduler();   /* start the scheduler; normally it never
                                * returns */

@@ -65,6 +65,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # 板级驱动 BSP
     Core/BSP/lcd.c
     Core/BSP/dht11.c
+    Core/BSP/bsp_adc.c
+    Core/BSP/bsp_uart_dma.c
+    Core/BSP/bsp_flash.c
+    Core/BSP/crc16.c
+    Core/BSP/ring_buffer.c
+    Core/BSP/param_storage.c
+
+    # 应用层: 自定义协议 + Modbus 从站
+    Core/App/custom_protocol.c
+    Core/App/modbus_rtu.c
 )
 
 # Add include paths
@@ -72,7 +82,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Third_Party/FreeRTOS/include                  # FreeRTOS.h / task.h / queue.h ...
     Third_Party/FreeRTOS/portable/GCC/ARM_CM3     # portmacro.h
     Third_Party/FreeRTOS                          # FreeRTOSConfig.h
-    Core/BSP                                      # lcd.h / lcdfont.h / dht11.h
+    Core/BSP                                      # lcd.h / lcdfont.h / dht11.h ...
+    Core/App                                      # app_shared.h / 协议头文件
     # Core/Inc、Drivers/... 已由 cmake/stm32cubemx 以 INTERFACE 方式提供，无需重复添加
 )
 

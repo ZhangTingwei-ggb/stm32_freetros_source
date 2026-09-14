@@ -246,4 +246,20 @@ void TIM1_UP_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/* USART1 + DMA1 Ch5 (串口 DMA 接收) 中断。handles 在 bsp_uart_dma.c 里。
+ * CubeMX 没配这两个外设, 这里手写, regenerate 冲不掉(USER CODE 段保留)。 */
+extern UART_HandleTypeDef huart1;
+extern DMA_HandleTypeDef  hdma_usart1_rx;
+void BSP_UART_IdleIsr( void );
+
+void USART1_IRQHandler( void )
+{
+    BSP_UART_IdleIsr();
+}
+
+void DMA1_Channel5_IRQHandler( void )
+{
+    HAL_DMA_IRQHandler( &hdma_usart1_rx );
+}
+
 /* USER CODE END 1 */
